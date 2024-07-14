@@ -21,26 +21,8 @@ db = client['meow-bot']
 users_collection = db['users']
 guilds_collection = db['guilds']
 
-# XP settings
-MESSAGE_XP = 25  # XP per message
-VOICE_XP = 15     # XP per minute in voice chat
-BASE_XP = 100  # Base XP for the first level
-EXPONENT = 1.15  # Growth rate for the XP curve
-MESSAGE_XP_COOLDOWN = 5  # Cooldown time in seconds
-
-STACK_ROLES = False
-REQUIRES_NOT_MUTED = False
-REQUIRES_NOT_ALONE = False
-
-LEVEL_ROLES = {
-    10: 1197677650349666314,
-    25: 1197677694285000784,
-    50: 1197680315519479898,
-    80: 1197680334750367924,
-    120: 1197680368183169185,
-}
-
-sorted_level_roles = dict(sorted(LEVEL_ROLES.items(), key=lambda item: item[0], reverse=True))
+def sort_level_roles(roles):
+    return dict(sorted(((int(lvl), int(role_id)) for lvl, role_id in roles.items()), key=lambda item: item[0], reverse=True))
 
 @bot.event
 async def on_ready():
@@ -50,48 +32,70 @@ async def on_ready():
 def getUTCtime():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-def calculate_xp(messages, voice_minutes):
-    return (messages * MESSAGE_XP) + (voice_minutes * VOICE_XP)
+async def get_guild_config(guild_id):
+    guild_data = await guilds_collection.find_one({'guild_id': str(guild_id)})
+    if guild_data:
+        for module in guild_data.get('modules', []):
+            if module['id'] == 'level':
+                return module.get('settings', {})
+    return {}
 
-def calculate_level(xp):
+async def calculate_xp(guild_id, messages, voice_minutes):
+    config = await get_guild_config(guild_id)
+    message_xp = config.get('MESSAGE_XP')
+    voice_xp = config.get('VOICE_XP')
+    return (messages * message_xp) + (voice_minutes * voice_xp)
+
+async def calculate_level(guild_id, xp):
+    config = await get_guild_config(guild_id)
+    base_xp = config.get('BASE_XP')
+    exponent = config.get('EXPONENT')
+
     level = 0
-    xp_needed = BASE_XP
+    xp_needed = base_xp
     while xp >= xp_needed:
         xp -= xp_needed
         level += 1
-        xp_needed = BASE_XP * (level ** EXPONENT)
+        xp_needed = base_xp * (level ** exponent)
     return level
 
 async def is_tracking_enabled(guild_id):
     guild_data = await guilds_collection.find_one({'guild_id': str(guild_id)})
-    return guild_data and guild_data.get('tracking_enabled', False)
+    if not guild_data: return False
+    for module in guild_data.get('modules', []):
+        if module['id'] == 'level':
+            return module.get('enabled', False)
+    return False
 
 async def assign_role(member, level):
+    config = await get_guild_config(member.guild.id)
+    stack_roles = config.get('STACK_ROLES')
+    level_roles = config.get('LEVEL_ROLES')
+    sorted_level_roles = sort_level_roles(level_roles)
     guild = member.guild
     roles_to_add = []
     roles_to_remove = []
     role_added = False
     highest_role = None
 
-    # return
     for lvl, role_id in sorted_level_roles.items():
-        role = guild.get_role(role_id)
-        if level >= lvl:
+        role = guild.get_role(int(role_id))
+        if level >= int(lvl):
             if not role_added:
                 highest_role = role
                 role_added = True
-            if STACK_ROLES:
+            if stack_roles:
                 if role not in member.roles:
                     roles_to_add.append(role)
         else:
             if role in member.roles:
                 roles_to_remove.append(role)
-
-    if not STACK_ROLES:
+ 
+    if not stack_roles:
         if highest_role and highest_role not in member.roles:
             roles_to_add = [highest_role]
         for lvl, role_id in sorted_level_roles.items():
-            role = guild.get_role(role_id)
+            role = guild.get_role(int(role_id))
             if role != highest_role and role in member.roles:
                 roles_to_remove.append(role)
 
@@ -99,7 +103,6 @@ async def assign_role(member, level):
         await member.add_roles(*roles_to_add)
     if roles_to_remove:
         await member.remove_roles(*roles_to_remove)
-    # print(roles_to_add, roles_to_remove)
          
                 
 async def update_user_data(member):
@@ -109,8 +112,8 @@ async def update_user_data(member):
     if user_data:
         messages = user_data.get('messages', 0)
         voice_minutes = user_data.get('voice_minutes', 0)
-        xp = calculate_xp(messages, voice_minutes)
-        level = calculate_level(xp)
+        xp = await calculate_xp(guild_id, messages, voice_minutes)
+        level = await calculate_level(guild_id, xp)
         await assign_role(member, level)
 
 async def update_user_data_message(member):
@@ -118,11 +121,14 @@ async def update_user_data_message(member):
     guild_id = str(member.guild.id)
     current_time = getUTCtime()
     
+    config = await get_guild_config(guild_id)
+    message_xp_cooldown = config.get('MESSAGE_XP_COOLDOWN')
+
     user_data = await users_collection.find_one({'user_id': user_id, 'guild_id': guild_id})
     if user_data: 
         last_message_time = user_data.get('last_message_time')
         if last_message_time:
-            if current_time - last_message_time < timedelta(seconds=MESSAGE_XP_COOLDOWN): return
+            if current_time - last_message_time < timedelta(seconds=message_xp_cooldown): return
     
     await users_collection.update_one(
         {'user_id': user_id, 'guild_id': guild_id},
@@ -144,10 +150,13 @@ async def update_user_data_voice(member):
         end_time = getUTCtime()
         duration = (end_time - start_time).total_seconds() / 60  # Duration in minutes
 
-        # Ensure member.voice is not None before accessing its attributes
+        config = await get_guild_config(guild_id)
+        requires_not_muted = config.get('REQUIRES_NOT_MUTED')
+        requires_not_alone = config.get('REQUIRES_NOT_ALONE')
+
         if member.voice:
-            if member.voice.self_mute and REQUIRES_NOT_MUTED: return
-            if len(member.voice.channel.members) == 1 and REQUIRES_NOT_ALONE: return
+            if member.voice.self_mute and requires_not_muted: return
+            if len(member.voice.channel.members) == 1 and requires_not_alone: return
 
         await users_collection.update_one(
             {'user_id': user_id, 'guild_id': guild_id},
@@ -207,46 +216,27 @@ async def on_voice_state_update(member, before, after):
                 {'$unset': {'voice_start': ""}}
             )
 
-@bot.slash_command(name="level", description="Say hello to the bot")
+@bot.slash_command(name="level", description="Show user's level")
 async def level(ctx: discord.ApplicationContext, member: discord.Member = None):
     if member is None:
         member = ctx.author
+
+    guild_id = str(ctx.guild.id)
     
+    if not await is_tracking_enabled(guild_id):
+        await ctx.respond(f'The leveling feature is not enabled on this server. Please enable it to use this command.')
+        return
+
     user_id = str(member.id)
-    guild_id = str(member.guild.id)
     user_data = await users_collection.find_one({'user_id': user_id, 'guild_id': guild_id})
+    
     if user_data:
         messages = user_data.get('messages', 0)
         voice_minutes = user_data.get('voice_minutes', 0)
-        xp = calculate_xp(messages, voice_minutes)
-        level = calculate_level(xp)
+        xp = await calculate_xp(guild_id, messages, voice_minutes)
+        level = await calculate_level(guild_id, xp)
         await ctx.respond(f'{member.display_name} is at level {level} with {xp} XP, {messages} messages sent, and {voice_minutes:.2f} minutes in voice chat.')
     else:
         await ctx.respond(f'No data found for {member.display_name}.')
-
-@bot.slash_command(name="set_xp")
-async def set_xp(ctx: discord.ApplicationContext, message_xp: int, voice_xp: int, level_multiplier: float):
-    global MESSAGE_XP, VOICE_XP, LEVEL_MULTIPLIER
-    MESSAGE_XP = message_xp
-    VOICE_XP = voice_xp
-    LEVEL_MULTIPLIER = level_multiplier
-    await ctx.respond(f'Settings updated: MESSAGE_XP={MESSAGE_XP}, VOICE_XP={VOICE_XP}, LEVEL_MULTIPLIER={LEVEL_MULTIPLIER}')
-
-@bot.slash_command(name="toggle_tracking")
-@commands.has_permissions(administrator=True)
-async def toggle_tracking(ctx: discord.ApplicationContext):
-    guild_id = str(ctx.guild.id)
-    tracking_status = await guilds_collection.find_one({'guild_id': guild_id})
-    if tracking_status and 'tracking_enabled' in tracking_status:
-        new_status = not tracking_status['tracking_enabled']
-    else:
-        new_status = True
-    await guilds_collection.update_one(
-        {'guild_id': guild_id},
-        {'$set': {'tracking_enabled': new_status}},
-        upsert=True
-    )
-    status_message = 'enabled' if new_status else 'disabled'
-    await ctx.respond(f'Activity tracking has been {status_message} for this guild.')
 
 bot.run(os.getenv('DISCORD_BOT_TOKEN')) 
