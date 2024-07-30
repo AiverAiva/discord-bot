@@ -1,9 +1,10 @@
-import os # default module
+import os
 import discord
 from discord.ext import commands, tasks
 import motor.motor_asyncio
 from collections import defaultdict
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 
 intents = discord.Intents.default()
@@ -42,22 +43,29 @@ async def get_guild_config(guild_id):
 
 async def calculate_xp(guild_id, messages, voice_minutes):
     config = await get_guild_config(guild_id)
-    message_xp = config.get('MESSAGE_XP')
-    voice_xp = config.get('VOICE_XP')
+    message_xp = int(config.get('MESSAGE_XP'))
+    voice_xp = int(config.get('VOICE_XP'))
     return (messages * message_xp) + (voice_minutes * voice_xp)
 
-async def calculate_level(guild_id, xp):
+async def calculate_level(guild_id: str, messages: int, voice_minutes: int):
     config = await get_guild_config(guild_id)
-    base_xp = config.get('BASE_XP')
-    exponent = config.get('EXPONENT')
+    message_xp: int = int(config.get('MESSAGE_XP'))
+    voice_xp: int = int(config.get('VOICE_XP'))
+    base_xp: int = int(config.get('BASE_XP'))
+    exponent: float = float(config.get('EXPONENT'))
 
-    level = 0
+    level: int = 0
+    percent: float = 0
     xp_needed = base_xp
+    xp = (messages * message_xp) + (voice_minutes * voice_xp)
+    
     while xp >= xp_needed:
         xp -= xp_needed
         level += 1
         xp_needed = base_xp * (level ** exponent)
-    return level
+    percent = xp / xp_needed
+    
+    return level, percent
 
 async def is_tracking_enabled(guild_id):
     guild_data = await guilds_collection.find_one({'guild_id': str(guild_id)})
@@ -112,8 +120,7 @@ async def update_user_data(member):
     if user_data:
         messages = user_data.get('messages', 0)
         voice_minutes = user_data.get('voice_minutes', 0)
-        xp = await calculate_xp(guild_id, messages, voice_minutes)
-        level = await calculate_level(guild_id, xp)
+        level, _ = await calculate_level(guild_id, messages, voice_minutes)
         await assign_role(member, level)
 
 async def update_user_data_message(member):
@@ -122,7 +129,7 @@ async def update_user_data_message(member):
     current_time = getUTCtime()
     
     config = await get_guild_config(guild_id)
-    message_xp_cooldown = config.get('MESSAGE_XP_COOLDOWN')
+    message_xp_cooldown: int = int(config.get('MESSAGE_XP_COOLDOWN'))
 
     user_data = await users_collection.find_one({'user_id': user_id, 'guild_id': guild_id})
     if user_data: 
@@ -233,9 +240,9 @@ async def level(ctx: discord.ApplicationContext, member: discord.Member = None):
     if user_data:
         messages = user_data.get('messages', 0)
         voice_minutes = user_data.get('voice_minutes', 0)
-        xp = await calculate_xp(guild_id, messages, voice_minutes)
-        level = await calculate_level(guild_id, xp)
-        await ctx.respond(f'{member.display_name} is at level {level} with {xp} XP, {messages} messages sent, and {voice_minutes:.2f} minutes in voice chat.')
+        level, percent = await calculate_level(guild_id, messages, voice_minutes)
+        barLen: int = 35
+        await ctx.respond(f'{member.display_name} is at level {level}\n{"[{:<{}}] {:.0f}%".format("=" * int(barLen * percent), barLen, percent * 100)}\n\n{messages} messages sent, and {voice_minutes:.2f} minutes in voice chat.')
     else:
         await ctx.respond(f'No data found for {member.display_name}.')
 
